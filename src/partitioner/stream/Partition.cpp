@@ -71,7 +71,7 @@ double Partition::getEdgesCount(bool isDirected) {
     for (auto edge : this->edgeList) {
         std::string vertex1 = edge.first;
         for (auto vertext : edge.second) {
-            uniqueEdges.insert(edge.first + vertext);
+            uniqueEdges.insert(edge.first + "|" + vertext);
         }
     }
     if (isDirected) {
