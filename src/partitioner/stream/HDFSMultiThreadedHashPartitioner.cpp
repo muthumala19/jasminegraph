@@ -18,6 +18,7 @@
 Logger hash_partitioner_logger;
 
 int PARTITION_FILE_EDGE_COUNT_THRESHOLD = 1000000;
+int BATCH_SIZE = 1000;
 
 HDFSMultiThreadedHashPartitioner::HDFSMultiThreadedHashPartitioner(int numberOfPartitions, int graphID,
     std::string masterIp, bool isDirected)
@@ -47,6 +48,10 @@ HDFSMultiThreadedHashPartitioner::HDFSMultiThreadedHashPartitioner(int numberOfP
 
 HDFSMultiThreadedHashPartitioner::~HDFSMultiThreadedHashPartitioner() {
     stopConsumerThreads();
+    while (!fileTransferQueue.empty()) {
+        fileTransferQueue.front().wait();
+        fileTransferQueue.pop();
+    }
 }
 
 void HDFSMultiThreadedHashPartitioner::addLocalEdge(const std::string &edge, int index) {
@@ -62,10 +67,10 @@ void HDFSMultiThreadedHashPartitioner::addLocalEdge(const std::string &edge, int
     }
 }
 
-void HDFSMultiThreadedHashPartitioner::addEdgeCut(const std::string &edge, int index) {
+void HDFSMultiThreadedHashPartitioner::addEdgeCut(const std::string &edge, int index, int foreignPartitionIndex, bool isDuplicateEdge) {
     if (index < numberOfPartitions) {
         std::lock_guard<std::mutex> lock(edgeCutsMutexes[index]);
-        edgeCutsArrays[index].push_back(edge);
+        edgeCutsArrays[index].push_back({edge, foreignPartitionIndex, isDuplicateEdge});
         edgeCutsReady[index] = true;
         edgeCutsAvailableCV[index].notify_one();
     } else {
@@ -77,243 +82,194 @@ void HDFSMultiThreadedHashPartitioner::addEdgeCut(const std::string &edge, int i
 
 void HDFSMultiThreadedHashPartitioner::stopConsumerThreads() {
     terminateConsumers = true;
+    for (auto& cv : edgeAvailableCV) cv.notify_all();
+    for (auto& cv : edgeCutsAvailableCV) cv.notify_all();
 
-    for (auto &cv : edgeAvailableCV) {
-        cv.notify_all();
-    }
-    for (auto &cv : edgeCutsAvailableCV) {
-        cv.notify_all();
-    }
+    for (auto& thread : localEdgeThreads)
+        if (thread.joinable()) thread.join();
 
-    // Join all threads to ensure clean termination
-    for (auto &thread : localEdgeThreads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    for (auto &thread : edgeCutThreads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
+    for (auto& thread : edgeCutThreads)
+        if (thread.joinable()) thread.join();
 }
 
 void HDFSMultiThreadedHashPartitioner::consumeLocalEdges(int partitionIndex, JasmineGraphServer::worker worker) {
-    int threadEdgeCount = 0;
-    int fileIndex = 0;
     std::ofstream partitionFile;
-    string fileName =
-            std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_localstore_" + std::to_string(fileIndex);
-    string filePath =
-            this->outputFilePath + "/" + fileName;
+    int edgeCount = 0, fileIndex = 0;
+    std::string filePath;
+    std::stringstream edgeBuffer;
 
-    // Open the first partition file initially
-    partitionFile.open(filePath);
-    if (!partitionFile.is_open()) {
-        hash_partitioner_logger.error("Error opening file for partition " + std::to_string(partitionIndex));
-        return;
-    }
+    auto openNewFile = [&]() {
+        filePath = outputFilePath + "/" + std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_localstore_" + std::to_string(fileIndex);
+        partitionFile.open(filePath);
+        if (!partitionFile.is_open())
+            hash_partitioner_logger.error("Cannot open local file for partition " + std::to_string(partitionIndex));
+    };
 
-    while (true) {  // Check for termination flag
+    openNewFile();
+
+    while (true) {
         std::unique_lock<std::mutex> lock(localEdgeMutexes[partitionIndex]);
-
-        // Wait until there are edges available or the thread is signaled to terminate
         edgeAvailableCV[partitionIndex].wait(lock, [this, partitionIndex] {
             return edgeReady[partitionIndex] || terminateConsumers;
         });
 
-        // If the consumer is terminating, close the file and break out of the loop
-        if (terminateConsumers) {
-            if (partitionFile.is_open()) {
-                partitionFile.close();
-                hash_partitioner_logger.debug("Local edge consumer " + std::to_string(partitionIndex) +
-                                              " generated file of " +
-                                              std::to_string(threadEdgeCount) +
-                                              " edges: " + filePath);
-                partitionMutexArray[partitionIndex].lock();
-                Utils::sendFileChunkToWorker(worker.hostname, worker.port, worker.dataPort, filePath, masterIp,
-                                             JasmineGraphInstanceProtocol::HDFS_LOCAL_STREAM_START);
-                partitionMutexArray[partitionIndex].unlock();
-            }
-            break;
-        }
+        if (terminateConsumers) break;
 
-        // Process the edges from the local array
         while (!localEdgeArrays[partitionIndex].empty()) {
             std::string edge = localEdgeArrays[partitionIndex].back();
             localEdgeArrays[partitionIndex].pop_back();
-
-            // Write the edge to the current partition file
-            partitionFile << edge << std::endl;
-            threadEdgeCount++;
-
-            // Check if the edge count has reached the threshold
-            if (threadEdgeCount == PARTITION_FILE_EDGE_COUNT_THRESHOLD) {
-                threadEdgeCount = 0;
-                partitionFile.close();  // Close the file after reaching the threshold
-
-                partitionMutexArray[partitionIndex].lock();
-                Utils::sendFileChunkToWorker(worker.hostname, worker.port, worker.dataPort, filePath, masterIp,
-                                             JasmineGraphInstanceProtocol::HDFS_LOCAL_STREAM_START);
-                partitionMutexArray[partitionIndex].unlock();
-
-                hash_partitioner_logger.debug("Local edge consumer " + std::to_string(partitionIndex) +
-                                              " generated file of " +
-                                              std::to_string(PARTITION_FILE_EDGE_COUNT_THRESHOLD) +
-                                              " edges: " + filePath);
-
-                // Increment file index and open the next file
-                fileIndex++;
-                fileName = std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_localstore_" +
-                           std::to_string(fileIndex);
-                filePath = this->outputFilePath + "/" + fileName;
-                partitionFile.open(filePath);
-                if (!partitionFile.is_open()) {
-                    hash_partitioner_logger.error("Error opening file for partition " + std::to_string(partitionIndex));
-                    break;
-                }
-            }
+            edgeBuffer << edge << "\n";
+            edgeCount++;
 
             auto jsonEdge = json::parse(edge);
-            string sourceId = std::string(jsonEdge["source"]["id"]);
-            string destinationId = std::string(jsonEdge["destination"]["id"]);
+            std::string src = jsonEdge["source"]["id"].get<std::string>(), dst = jsonEdge["destination"]["id"].get<std::string>();
+            {
+                std::lock_guard<std::mutex> partitionLock(partitionLocks[partitionIndex]);
+                partitions[partitionIndex].addEdge({src, dst}, isDirected);
+            }
 
-            std::lock_guard<std::mutex> partitionLock(partitionLocks[partitionIndex]);
-            partitions[partitionIndex].addEdge({sourceId, destinationId}, isDirected);
+            if (edgeCount % BATCH_SIZE == 0) {
+                partitionFile << edgeBuffer.str();
+                edgeBuffer.str("");
+                edgeBuffer.clear();
+            }
+
+            if (edgeCount >= PARTITION_FILE_EDGE_COUNT_THRESHOLD) {
+                partitionFile << edgeBuffer.str();
+                edgeBuffer.str("");
+                edgeBuffer.clear();
+
+                partitionFile.close();
+                fileTransferQueue.push(std::async(std::launch::async, [this, filePath, worker, partitionIndex]() {
+                    this->asyncSendFileToWorker(partitionIndex, filePath, worker, JasmineGraphInstanceProtocol::HDFS_LOCAL_STREAM_START);
+                }));
+
+                fileIndex++;
+                edgeCount = 0;
+                openNewFile();
+            }
         }
 
-        // Reset the flag after processing the current batch of edges
         edgeReady[partitionIndex] = false;
     }
 
-    // Ensure the file is closed if it remains open
     if (partitionFile.is_open()) {
+        partitionFile << edgeBuffer.str();
+        edgeBuffer.str("");
+        edgeBuffer.clear();
         partitionFile.close();
+        fileTransferQueue.push(std::async(std::launch::async, [this, filePath, worker, partitionIndex]() {
+            this->asyncSendFileToWorker(partitionIndex, filePath, worker, JasmineGraphInstanceProtocol::HDFS_LOCAL_STREAM_START);
+        }));
     }
-    hash_partitioner_logger.debug("Local edge consumer " + std::to_string(partitionIndex) + " finished processing.");
 }
+
 
 void HDFSMultiThreadedHashPartitioner::consumeEdgeCuts(int partitionIndex, JasmineGraphServer::worker worker) {
-    int threadEdgeCount = 0;
-    int fileIndex = 0;
     std::ofstream edgeCutsFile;
-    string fileName = std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_centralstore_" +
-                      std::to_string(fileIndex);
-    string filePath =
-            this->outputFilePath + "/" + fileName;
+    int edgeCount = 0, fileIndex = 0;
+    std::string filePath;
+    std::stringstream edgeBuffer;
 
-    // Open the first file for edge cuts
-    edgeCutsFile.open(filePath);
-    if (!edgeCutsFile.is_open()) {
-        hash_partitioner_logger.error("Error opening edge cuts file for partition " + std::to_string(partitionIndex));
-        return;
-    }
+    auto openNewFile = [&]() {
+        filePath = outputFilePath + "/" + std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_centralstore_" + std::to_string(fileIndex);
+        edgeCutsFile.open(filePath);
+        if (!edgeCutsFile.is_open()) {
+            hash_partitioner_logger.error("Cannot open central file for partition " + std::to_string(partitionIndex));
+        }
+    };
 
-    while (!terminateConsumers) {  // Check for termination flag
+    openNewFile();
+
+    while (true) {
         std::unique_lock<std::mutex> lock(edgeCutsMutexes[partitionIndex]);
         edgeCutsAvailableCV[partitionIndex].wait(lock, [this, partitionIndex] {
-            return edgeCutsReady[partitionIndex] || terminateConsumers;  // Break if termination is signaled
+            return edgeCutsReady[partitionIndex] || terminateConsumers;
         });
 
-        if (terminateConsumers) {
-            if (edgeCutsFile.is_open()) {
-                edgeCutsFile.close();
-                hash_partitioner_logger.debug("Central edge consumer " + std::to_string(partitionIndex) +
-                                              " generated file of " +
-                                              std::to_string(threadEdgeCount) +
-                                              " edges: " + filePath);
-                partitionMutexArray[partitionIndex].lock();
-                Utils::sendFileChunkToWorker(worker.hostname, worker.port, worker.dataPort, filePath, masterIp,
-                                             JasmineGraphInstanceProtocol::HDFS_CENTRAL_STREAM_START);
-                partitionMutexArray[partitionIndex].unlock();
-            }
-            break;
-        }
+        if (terminateConsumers) break;
 
-        // Process edges from edgeCutsArrays
         while (!edgeCutsArrays[partitionIndex].empty()) {
-            std::string edge = edgeCutsArrays[partitionIndex].back();
+            EdgeInfo edgeInfo = edgeCutsArrays[partitionIndex].back();
             edgeCutsArrays[partitionIndex].pop_back();
+            edgeBuffer << edgeInfo.edge << "\n";
+            edgeCount++;
 
-            // Write the edge to the file
-            edgeCutsFile << edge << std::endl;
-            threadEdgeCount++;
+            auto jsonEdge = json::parse(edgeInfo.edge);
+            std::string src = jsonEdge["source"]["id"].get<std::string>(), dst = jsonEdge["destination"]["id"].get<std::string>();
 
-            // If threshold reached, close current file and open a new one
-            if (threadEdgeCount == PARTITION_FILE_EDGE_COUNT_THRESHOLD) {
-                threadEdgeCount = 0;
-                edgeCutsFile.close();
-
-                partitionMutexArray[partitionIndex].lock();
-                Utils::sendFileChunkToWorker(worker.hostname, worker.port, worker.dataPort, filePath, masterIp,
-                                             JasmineGraphInstanceProtocol::HDFS_CENTRAL_STREAM_START);
-                partitionMutexArray[partitionIndex].unlock();
-
-                hash_partitioner_logger.debug("Central edge consumer " + std::to_string(partitionIndex) +
-                                              " generated file of " +
-                                              std::to_string(PARTITION_FILE_EDGE_COUNT_THRESHOLD) +
-                                              " edges: " + filePath);
-
-                // Open the next file
-                fileIndex++;
-                fileName = std::to_string(graphId) + "_" + std::to_string(partitionIndex) + "_centralstore_" +
-                           std::to_string(fileIndex);
-                filePath = this->outputFilePath + "/" + fileName;
-                edgeCutsFile.open(filePath);
-                if (!edgeCutsFile.is_open()) {
-                    hash_partitioner_logger.error(
-                            "Error opening edge cuts file for partition " + std::to_string(partitionIndex));
-                    break;
-                }
-            }
-            auto jsonEdge = json::parse(edge);
-            string sourceId = std::string(jsonEdge["source"]["id"]);
-            string destinationId = std::string(jsonEdge["destination"]["id"]);
-
-            // Add edge cuts to the partition
             std::lock_guard<std::mutex> partitionLock(partitionLocks[partitionIndex]);
-            partitions[partitionIndex].addToEdgeCuts(sourceId, destinationId, partitionIndex);
+            if (!edgeInfo.isDuplicate) {
+                partitions[partitionIndex].addToEdgeCuts(src, dst, edgeInfo.foreignPartitionIndex);
+            } else {
+                partitions[partitionIndex].addToEdgeCuts(dst, src, edgeInfo.foreignPartitionIndex);
+            }
+
+            if (edgeCount % BATCH_SIZE == 0) {
+                edgeCutsFile << edgeBuffer.str();
+                edgeBuffer.str("");
+                edgeBuffer.clear();
+            }
+
+            if (edgeCount >= PARTITION_FILE_EDGE_COUNT_THRESHOLD) {
+                edgeCutsFile << edgeBuffer.str();
+                edgeBuffer.str("");
+                edgeBuffer.clear();
+
+                edgeCutsFile.close();
+                fileTransferQueue.push(std::async(std::launch::async, [this, filePath, worker, partitionIndex]() {
+                    this->asyncSendFileToWorker(partitionIndex, filePath, worker, JasmineGraphInstanceProtocol::HDFS_CENTRAL_STREAM_START);
+                }));
+                fileIndex++;
+                edgeCount = 0;
+                openNewFile();
+            }
         }
 
-        edgeCutsReady[partitionIndex] = false;  // Reset the flag after processing
+        edgeCutsReady[partitionIndex] = false;
     }
 
-//     Ensure the file is closed when the consumer is done
     if (edgeCutsFile.is_open()) {
+        edgeCutsFile << edgeBuffer.str();
+        edgeBuffer.str("");
+        edgeBuffer.clear();
         edgeCutsFile.close();
+        fileTransferQueue.push(std::async(std::launch::async, [this, filePath, worker, partitionIndex]() {
+            this->asyncSendFileToWorker(partitionIndex, filePath, worker, JasmineGraphInstanceProtocol::HDFS_CENTRAL_STREAM_START);
+        }));
     }
-    hash_partitioner_logger.debug("Central edge consumer " + std::to_string(partitionIndex) + " finished processing.");
 }
 
+void HDFSMultiThreadedHashPartitioner::asyncSendFileToWorker(int partitionIndex,
+                                                              const std::string& path,
+                                                              const JasmineGraphServer::worker& worker,
+                                                              const std::string& streamType) {
+    std::lock_guard<std::mutex> lock(partitionMutexArray[partitionIndex]);
+    Utils::sendFileChunkToWorker(worker.hostname, worker.port, worker.dataPort, path, masterIp, streamType);
+}
+
+
 void HDFSMultiThreadedHashPartitioner::updatePartitionTable() {
-    auto *sqlite = new SQLiteDBInterface();
-    sqlite->init();
-
-    std::mutex dbLock;
+    SQLiteDBInterface sqlite;
+    sqlite.init();
     for (int i = 0; i < numberOfPartitions; i++) {
-        string sqlStatement =
-            "INSERT INTO partition (idpartition,graph_idgraph,vertexcount,central_vertexcount,"
-            "edgecount,central_edgecount) VALUES(\"" +
-            std::to_string(i) + "\", \"" +
-            std::to_string(this->graphId) + "\", \"" +
-            std::to_string(partitions.at(i).getLocalVertexCount()) + "\",\"" +
-            std::to_string(partitions.at(i).getCentralVertexCount(i)) + "\",\"" +
-            std::to_string(partitions.at(i).getEdgesCount(isDirected)) + "\", \"" +
-            std::to_string(partitions.at(i).edgeCutsCount())+ "\")";
-
-        dbLock.lock();
-        sqlite->runUpdate(sqlStatement);
-        dbLock.unlock();
+        std::string sql = "INSERT INTO partition (idpartition,graph_idgraph,vertexcount,central_vertexcount,"
+              "edgecount,central_edgecount) VALUES('" +
+              std::to_string(i) + "','" +
+              std::to_string(graphId) + "','" +
+              std::to_string(partitions[i].getLocalVertexCount()) + "','" +
+              std::to_string(partitions[i].getCentralVertexCount(i)) + "','" +
+              std::to_string(partitions[i].getEdgesCount(isDirected)) + "','" +
+              std::to_string(partitions[i].edgeCutsCount()) + "')";
+        sqlite.runUpdate(sql);
     }
-
-    sqlite->finalize();
-    delete sqlite;
+    sqlite.finalize();
 }
 
 long HDFSMultiThreadedHashPartitioner::getVertexCount() {
     int totalVertices = 0;
     for (auto & partition : this->partitions) {
-        totalVertices += partition.getVertextCount();
+        totalVertices += partition.getVertextCountQuick();
     }
     return totalVertices;
 }
