@@ -6,6 +6,7 @@ create table graph
     upload_path                 VARCHAR(300) not null,
     upload_start_time           TIME         not null,
     upload_end_time             TIME         not null,
+    report_time                 TIME,
     graph_status_idgraph_status INTEGER      not null,
     id_algorithm                INTEGER,
     vertexcount                 BIGINT default 0,
