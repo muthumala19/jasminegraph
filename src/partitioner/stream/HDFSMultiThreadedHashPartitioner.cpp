@@ -327,3 +327,34 @@ long HDFSMultiThreadedHashPartitioner::getEdgeCount() {
     }
     return  totalEdges + edgeCuts / 2;
 }
+
+void HDFSMultiThreadedHashPartitioner::startPeriodicStatsUpdater(std::atomic<bool> &runningFlag, int intervalSeconds, SQLiteDBInterface *sqlite) {
+    std::thread([this, &runningFlag, intervalSeconds, sqlite ]() {
+        while (runningFlag) {
+            std::time_t time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::this_thread::sleep_for(std::chrono::seconds(intervalSeconds));
+            long currentVertices = getVertexCount();
+            long currentEdges = getEdgeCount();
+
+            std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::string timeStr = std::ctime(&now);
+            timeStr.pop_back(); // remove newline
+
+            std::string logEntry = "Time: " + timeStr + " | Vertices: " + std::to_string(currentVertices) +
+                                   " | Edges: " + std::to_string(currentEdges);
+
+            // Log or insert into DB
+            if (sqlite) {
+                std::string insertQuery = "UPDATE graph SET vertexcount = '" + std::to_string(currentVertices) +
+                           "', centralpartitioncount = '" + std::to_string(this->numberOfPartitions) +
+                           "', edgecount = '" + std::to_string(currentEdges) +
+                           "', report_time = '" + ctime(&time) +
+                           "' WHERE idgraph = '" + std::to_string(this->graphId) + "'";
+                sqlite->runInsert(insertQuery);
+            }
+
+            hash_partitioner_logger.info("Periodic DB update: vertices = " + std::to_string(currentVertices) +
+                                        ", edges = " + std::to_string(currentEdges));
+        }
+    }).detach();
+}

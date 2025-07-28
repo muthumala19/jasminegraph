@@ -166,14 +166,8 @@ void HDFSStreamHandler::streamFromBufferToProcessingQueueEdgeListGraph(HDFSMulti
                         partitioner.addLocalEdge(edgeObj.dump(), sourceIndex);
                     } else {
                         // Add both directions for edge cut
-                        partitioner.addEdgeCut(edgeObj.dump(), sourceIndex);
-
-                        json reversedObj = {
-                            {"source", destination},
-                            {"destination", source},
-                            {"properties", edgeObj["properties"]}
-                        };
-                        partitioner.addEdgeCut(reversedObj.dump(), destIndex);
+                        partitioner.addEdgeCut(edgeObj.dump(), sourceIndex,destIndex, false);
+                        partitioner.addEdgeCut(edgeObj.dump(), destIndex,sourceIndex, true);
                     }
                 } catch (const std::invalid_argument &e) {
                     hdfs_stream_handler_logger.error("Invalid numeric node ID in line: " + line);
@@ -233,15 +227,8 @@ void HDFSStreamHandler::streamFromBufferToProcessingQueuePropertyGraph(HDFSMulti
                     if (sourceIndex == destIndex) {
                         partitioner.addLocalEdge(obj.dump(), sourceIndex);
                     } else {
-                        partitioner.addEdgeCut(obj.dump(), sourceIndex);
-
-                        json reversedObj = {
-                            {"source", destination},
-                            {"destination", source},
-                            {"properties", jsonEdge["properties"]}
-                        };
-
-                        partitioner.addEdgeCut(reversedObj.dump(), destIndex);
+                        partitioner.addEdgeCut(obj.dump(), sourceIndex,destIndex, false);
+                        partitioner.addEdgeCut(obj.dump(), destIndex, sourceIndex, true);
                     }
                 } else {
                     hdfs_stream_handler_logger.error("Malformed line: missing source/destination ID: " + line);
@@ -267,6 +254,9 @@ void HDFSStreamHandler::startStreamingFromBufferToPartitions() {
     std::thread readerThread(&HDFSStreamHandler::streamFromHDFSIntoBuffer, this);
     std::vector<std::thread> bufferProcessorThreads;
 
+    std::atomic<bool> statsRunning = true;
+    partitioner.startPeriodicStatsUpdater(statsRunning, 120, sqlite);
+
     if (isEdgeListType) {
         for (int i = 0; i < Conts::HDFS::EDGE_SEPARATION_LAYER_THREAD_COUNT; ++i) {
             bufferProcessorThreads.emplace_back(&HDFSStreamHandler::streamFromBufferToProcessingQueueEdgeListGraph,
@@ -283,6 +273,9 @@ void HDFSStreamHandler::startStreamingFromBufferToPartitions() {
     for (auto &thread : bufferProcessorThreads) {
         thread.join();
     }
+
+    statsRunning = false;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 
     long vertices = partitioner.getVertexCount();
     long edges = partitioner.getEdgeCount();
