@@ -1405,7 +1405,7 @@ void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsSer
         frontend_logger.error("HDFS server port is empty.");
     }
 
-    std::string message2 = "HDFS file path: ";
+    std::string message2 = "Enter the graph name and HDFS file path in the format: graph_name|hdfs_file_path";
     resultWr = write(connFd, message2.c_str(), message2.length());
     if (resultWr < 0) {
         frontend_logger.error("Error writing to socket");
@@ -1424,6 +1424,20 @@ void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsSer
     read(connFd, hdfsFilePath, FRONTEND_DATA_LENGTH);
     std::string hdfsFilePathS(hdfsFilePath);
     hdfsFilePathS = Utils::trim_copy(hdfsFilePathS);
+
+    std::string graphName;
+    size_t delimiterPos = hdfsFilePathS.find('|');
+    if (delimiterPos != std::string::npos) {
+        graphName = Utils::trim_copy(hdfsFilePathS.substr(0, delimiterPos));
+        hdfsFilePathS = Utils::trim_copy(hdfsFilePathS.substr(delimiterPos + 1));
+    } else {
+        frontend_logger.error("Invalid input format. Expected format: graph_name|hdfs_file_path");
+        std::string error_message = "Invalid input. Please provide input in format: graph_name|hdfs_file_path";
+        write(connFd, error_message.c_str(), error_message.length());
+        write(connFd, Conts::CARRIAGE_RETURN_NEW_LINE.c_str(), Conts::CARRIAGE_RETURN_NEW_LINE.size());
+        *loop_exit_p = true;
+        return;
+    }
 
     HDFSConnector *hdfsConnector = new HDFSConnector(hdfsServerIp, hdfsPort);
 
@@ -1492,14 +1506,17 @@ void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsSer
 
     std::string path = "hdfs:" + hdfsFilePathS;
 
-    std::time_t time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::string uploadStartTime = ctime(&time);
+    auto uploadStart = std::chrono::system_clock::now();
+    std::time_t startTimeT = std::chrono::system_clock::to_time_t(uploadStart);
+    std::string uploadStartTime = ctime(&startTimeT);
+
     std::string sqlStatement =
-            "INSERT INTO graph (name, upload_path, upload_start_time, upload_end_time, graph_status_idgraph_status, "
-            "vertexcount, centralpartitioncount, edgecount, is_directed) VALUES(\"" +
-            hdfsFilePathS + "\", \"" + path + "\", \"" + uploadStartTime + "\", \"\", \"" +
-            std::to_string(Conts::GRAPH_STATUS::NONOPERATIONAL) + "\", \"\", \"\", \"\", \"" +
-            (directed ? "TRUE" : "FALSE") + "\")";
+        "INSERT INTO graph (name, upload_path, upload_start_time, upload_end_time, graph_status_idgraph_status, "
+        "vertexcount, centralpartitioncount, edgecount, is_directed) VALUES(\"" +
+        graphName + "\", \"" + path + "\", \"" + uploadStartTime + "\", \"\", \"" +
+        std::to_string(Conts::GRAPH_STATUS::NONOPERATIONAL) + "\", \"\", \"\", \"\", \"" +
+        (directed ? "TRUE" : "FALSE") + "\")";
+
 
     int newGraphID = sqlite->runInsert(sqlStatement);
     frontend_logger.info("Created graph ID: " + std::to_string(newGraphID));
@@ -1510,13 +1527,18 @@ void addStreamHDFSCommand(std::string masterIP, int connFd, std::string &hdfsSer
     inputStreamHandlerThread = std::thread(&HDFSStreamHandler::startStreamingFromBufferToPartitions, streamHandler);
     inputStreamHandlerThread.join();
 
-    std::string uploadEndTime = ctime(&time);
+    auto uploadEnd = std::chrono::system_clock::now();
+    std::time_t endTimeT = std::chrono::system_clock::to_time_t(uploadEnd);
+    std::string uploadEndTime = ctime(&endTimeT);
+
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(uploadEnd - uploadStart).count();
     std::string sqlStatementUpdateEndTime =
             "UPDATE graph "
-            "SET upload_end_time = \"" + uploadEndTime + "\" "
-                                                         "WHERE idgraph = " + std::to_string(newGraphID);
-    sqlite->runInsert(sqlStatementUpdateEndTime);
+            "SET upload_end_time = \"" + uploadEndTime + "\", "
+            "upload_time = " + std::to_string(duration);
 
+    sqlStatementUpdateEndTime += " WHERE idgraph = " + std::to_string(newGraphID);
+    sqlite->runInsert(sqlStatementUpdateEndTime);
 
     int conResultWr = write(connFd, DONE.c_str(), DONE.length());
     if (conResultWr < 0) {
